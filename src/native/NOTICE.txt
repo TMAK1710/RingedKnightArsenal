@@ -1,0 +1,7 @@
+// Adapted from fjdsjd/pbz-mc, PolyForm Noncommercial 1.0.0.
+// Required Notice: Copyright (c) 2026 桃天帝不差
+// Required Notice: 黑神话：史蒂夫 — 作者 / B站：桃天帝不差
+
+Native damage and guard portions adapted for Ringed Knight Arsenal.
+No Minecraft assets or PBZMC save/health/campaign systems are used.
+UE4SS, fmt, nlohmann/json and MinHook retain their original licenses.
