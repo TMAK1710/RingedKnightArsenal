@@ -21,6 +21,52 @@ for rel,kind,value in [(MOD,'Mod','release-mod'),(LOADER,'Loader','fake-loader')
 manifest=dict(Version='fixture',GameSHA256=sha(GAME/'platform/steam/PBZ.exe'),Files=entries)
 def save_manifest():write(PACKAGE/'manifest.json',json.dumps(manifest))
 save_manifest()
+def verify_discovery(library_has_game):
+    steam=CASE/'Steam'
+    libraries=steam/'steamapps/libraryfolders.vdf'
+    library_path=str(CASE).replace('\\','\\\\')
+    write(libraries, f'"libraryfolders" {{ "0" {{ "path" "__MISSING_DRIVE__" }} "1" {{ "path" "{library_path}" }} }}')
+    if library_has_game:
+        p=CASE/'steamapps/common/PBZ/platform/steam/PBZ.exe'
+        write(p,(GAME/'platform/steam/PBZ.exe').read_text())
+    else:
+        (CASE/'steamapps/common/PBZ/platform/steam/PBZ.exe').unlink()
+    wrapper=CASE/'verify-discovery.ps1'
+    write(wrapper,r"""
+param($Setup,$SteamRoot,$PackageRoot,$ManualGamePath,[int]$ExpectAutomatic)
+$ErrorActionPreference='Stop'
+$usedLetters=[IO.DriveInfo]::GetDrives() | ForEach-Object {$_.Name.Substring(0,1)}
+$missingLetter='Z','Y','X','W','V','U' | Where-Object {$_ -notin $usedLetters -and -not (Get-PSDrive -Name $_ -ErrorAction SilentlyContinue)} | Select-Object -First 1
+if(-not $missingLetter){throw 'No unused drive letter for test'}
+$missingRoot="${missingLetter}:\SteamLibrary"
+$vdf=[IO.Path]::Combine($SteamRoot,'steamapps/libraryfolders.vdf')
+[IO.File]::WriteAllText($vdf,[IO.File]::ReadAllText($vdf).Replace('__MISSING_DRIVE__',$missingRoot.Replace('\','\\')))
+function Get-ItemProperty {
+    param([Alias('LiteralPath')]$Path)
+    if($Path -like 'HKCU:*'){[pscustomobject]@{SteamPath=$SteamRoot}}
+    else{[pscustomobject]@{InstallPath=$missingRoot}}
+}
+function Add-Type {
+    param($AssemblyName)
+    if($ExpectAutomatic){throw 'Opened a folder picker despite finding the game'}
+}
+function New-Object {
+    param($TypeName)
+    if($TypeName -ne 'Windows.Forms.FolderBrowserDialog'){throw "Unexpected type $TypeName"}
+    $dialog=[pscustomobject]@{Description='';SelectedPath=$ManualGamePath}
+    $dialog | Add-Member -MemberType ScriptMethod -Name ShowDialog -Value {Write-Host 'Folder picker reached';'OK'}
+    $dialog
+}
+& $Setup -Action Verify -PackageRoot $PackageRoot
+""")
+    result=subprocess.run(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass','-File',str(wrapper),
+        str(ROOT/'installer/Setup.ps1'),str(steam),str(PACKAGE),str(GAME),str(int(library_has_game))],
+        capture_output=True,text=True)
+    assert result.returncode==0 and 'Verified 3 payload files' in result.stdout,(result.stdout,result.stderr)
+    assert ('Folder picker reached' in result.stdout) != library_has_game,result.stdout
+
+verify_discovery(library_has_game=True)
+verify_discovery(library_has_game=False)
 def run(action,ok=True):
     p=subprocess.run(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass','-File',str(ROOT/'installer/Setup.ps1'),'-Action',action,'-GamePath',str(GAME),'-PackageRoot',str(PACKAGE)],capture_output=True,text=True)
     assert (p.returncode==0)==ok,(action,p.stdout,p.stderr)
@@ -50,4 +96,4 @@ rel='blocked/file.txt';write(PACKAGE/'payload'/rel,'new-file');write(GAME/'block
 manifest['Files'].append(dict(Path=rel,Kind='Mod',SHA256=sha(PACKAGE/'payload'/rel)));save_manifest()
 run('Install',False);assert (GAME/MOD).read_text()=='previous-mod'
 assert SAVE.read_text()=='original-save' and OTHER.read_text()=='unrelated-mod'
-print(json.dumps({'result':'PASS','checks':['install','backup','uninstall-restore','shared-loader-retained','other-mod-preserved','settings-preserved','user-edit-preserved','loader-conflict','corruption','game-version','path-escape','late-failure-rollback'],'fixture':str(CASE)}))
+print(json.dumps({'result':'PASS','checks':['steam-discovery-missing-drive','folder-picker-fallback','install','backup','uninstall-restore','shared-loader-retained','other-mod-preserved','settings-preserved','user-edit-preserved','loader-conflict','corruption','game-version','path-escape','late-failure-rollback'],'fixture':str(CASE)}))

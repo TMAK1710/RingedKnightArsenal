@@ -29,13 +29,33 @@ function Put([string]$source,[string]$target){
 function FindGame {
     $roots=@()
     foreach($key in @('HKCU:\Software\Valve\Steam','HKLM:\SOFTWARE\WOW6432Node\Valve\Steam')){
-        if(Test-Path $key){$v=Get-ItemProperty $key;foreach($n in @('SteamPath','InstallPath')){if($v.PSObject.Properties.Name -contains $n){$roots+=([string]$v.$n)}}}
+        $entry=Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+        if($null -eq $entry){continue}
+        foreach($name in @('SteamPath','InstallPath')){
+            if($entry.PSObject.Properties.Name -contains $name){$roots+=([string]$entry.$name)}
+        }
     }
     $libraries=@($roots)
-    foreach($root in $roots){$vdf=Join-Path $root 'steamapps/libraryfolders.vdf';if(Test-Path -LiteralPath $vdf){
-        foreach($m in [regex]::Matches([IO.File]::ReadAllText($vdf),'"path"\s+"([^"]+)"')){$libraries+=$m.Groups[1].Value.Replace('\\','\')}
-    }}
-    $found=@($libraries | ForEach-Object {Join-Path $_ 'steamapps/common/PBZ'} | Select-Object -Unique | Where-Object {Test-Path -LiteralPath (Join-Path $_ 'platform/steam/PBZ.exe')})
+    foreach($root in $roots){
+        if($root -notmatch '^(?:[A-Za-z]:[\\/]|[\\/]{2})' -or -not [IO.Directory]::Exists($root)){continue}
+        $vdf=[IO.Path]::Combine($root,'steamapps/libraryfolders.vdf')
+        if(-not [IO.File]::Exists($vdf)){continue}
+        try{$contents=[IO.File]::ReadAllText($vdf)}
+        catch [IO.IOException]{continue}
+        catch [UnauthorizedAccessException]{continue}
+        foreach($match in [regex]::Matches($contents,'"path"\s+"([^"]+)"')){
+            $libraries+=$match.Groups[1].Value.Replace('\\','\')
+        }
+    }
+    # Steam can remember drives that are no longer mounted. Check them before joining paths.
+    $found=@(foreach($library in $libraries){
+        if($library -notmatch '^(?:[A-Za-z]:[\\/]|[\\/]{2})' -or -not [IO.Directory]::Exists($library)){continue}
+        $game=[IO.Path]::Combine($library,'steamapps/common/PBZ')
+        if([IO.File]::Exists([IO.Path]::Combine($game,'platform/steam/PBZ.exe'))){
+            [IO.Path]::GetFullPath($game)
+        }
+    })
+    $found=@($found | Sort-Object -Unique)
     if($found.Count -eq 1){return $found[0]}
     Add-Type -AssemblyName System.Windows.Forms
     $dialog=New-Object Windows.Forms.FolderBrowserDialog
