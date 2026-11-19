@@ -56,6 +56,8 @@ python src/test_native_control_lease.py
 
 `Kind=Mod` 为独占文件；`Loader` 不覆盖不匹配的共享加载器；`Settings` 保留现有设置。完整包还需所有 Lua、私人 JSON、原生 DLL／许可证、音频、两组资产容器，以及匹配 UE4SS 和 `UEHelpers`。两模块各用 `enabled.txt` 启用，不覆盖用户 `mods.txt`。
 
+若仅 `dwmapi.dll` 不同，UE4SS 本体一致时可确认保留现有启动器。需要先确认该启动器能加载默认目录中的 UE4SS。
+
 禁止把原版游戏执行文件、存档、调试队列、崩溃转储、密钥或整套其他 Mod 放进 payload。完整本地素材包不得作为本仓库 Release 上传。
 
 `python installer/test_setup.py` 用临时模拟目录检查安装事务，不启动游戏。输出保存在仓库 `build/release-tests`。

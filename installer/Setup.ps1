@@ -91,22 +91,55 @@ $manifest=Get-Content -LiteralPath (Join-Path $PackageRoot 'manifest.json') -Raw
 if((Hash $exe) -ne $manifest.GameSHA256){throw 'Unsupported game executable. This package is pinned to Steam build 26367565; no files changed.'}
 $files=@($manifest.Files)
 if($files.Count -eq 0){throw 'Empty package'}
+$proxyPath='platform/steam/dwmapi.dll'
+$corePath='platform/steam/ue4ss/UE4SS.dll'
+$proxyDiffers=$false
 $seen=@{}
 foreach($entry in $files){
     if($seen.ContainsKey($entry.Path)){throw 'Duplicate package destination'};$seen[$entry.Path]=$true
     $source=SafePath (Join-Path $PackageRoot 'payload') $entry.Path
     $target=SafePath $GamePath $entry.Path
     if((Hash $source) -ne $entry.SHA256){throw "Damaged package: $($entry.Path)"}
-    if($entry.Kind -eq 'Loader' -and (Test-Path -LiteralPath $target) -and (Hash $target) -ne $entry.SHA256){throw "Different UE4SS installation detected: $($entry.Path). Kept untouched; resolve loader compatibility first."}
+    if($entry.Kind -eq 'Loader' -and (Test-Path -LiteralPath $target) -and (Hash $target) -ne $entry.SHA256){
+        if($entry.Path -eq $proxyPath){$proxyDiffers=$true;continue}
+        if($entry.Path -eq $corePath){
+            throw 'UE4SS core differs: platform/steam/ue4ss/UE4SS.dll. This mod requires the exact bundled core. No files changed. Use a separate clean game installation or check with the maintainer of your existing mods.'
+        }
+        throw "Different shared UE4SS file: $($entry.Path). No files changed."
+    }
+}
+if($proxyDiffers){
+    $core=SafePath $GamePath $corePath
+    if(-not $seen.ContainsKey($corePath) -or -not [IO.File]::Exists($core)){
+        throw 'A different dwmapi.dll exists, but the required platform/steam/ue4ss/UE4SS.dll is missing. No files changed. Identify the existing loader before replacing it.'
+    }
+    foreach($alternative in @('platform/steam/override.txt','platform/steam/UE4SS.dll')){
+        if(Test-Path -LiteralPath (SafePath $GamePath $alternative)){
+            throw "Existing loader may use a different UE4SS location ($alternative). No files changed. Check which UE4SS.dll the game loads."
+        }
+    }
+    Write-Warning 'Existing dwmapi.dll differs, but the UE4SS core matches. Setup can preserve the existing dwmapi.dll.'
 }
 if($Action -eq 'Verify'){Write-Host "Verified $($files.Count) payload files and game compatibility.";return}
 if(Test-Path -LiteralPath $receiptPath){
     $old=Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
     if($old.PackageHash -eq (Hash (Join-Path $PackageRoot 'manifest.json'))){
-        $ok=$true;foreach($entry in $files){if($entry.Kind -eq 'Settings'){continue};$t=SafePath $GamePath $entry.Path;if(-not(Test-Path -LiteralPath $t) -or (Hash $t) -ne $entry.SHA256){$ok=$false;break}}
+        $ok=$true
+        foreach($entry in $files){
+            if($entry.Kind -eq 'Settings' -or ($proxyDiffers -and $entry.Path -eq $proxyPath)){continue}
+            $t=SafePath $GamePath $entry.Path
+            if(-not(Test-Path -LiteralPath $t) -or (Hash $t) -ne $entry.SHA256){$ok=$false;break}
+        }
         if($ok){Write-Host 'This exact package is already installed.';return}
     }
     throw 'A managed installation already exists. Uninstall it first (backups are preserved), then install this package.'
+}
+if($proxyDiffers){
+    Write-Host 'Continue only if your existing loader already starts UE4SS from platform/steam/ue4ss.'
+    if((Read-Host 'Keep your current dwmapi.dll and install the mod? [y/N]') -ne 'y'){
+        Write-Host 'Canceled. No files changed.'
+        return
+    }
 }
 $run='install-'+(Get-Date -Format yyyyMMdd-HHmmss)+'-'+[guid]::NewGuid().ToString('N').Substring(0,8)
 $session=SafePath $stateRoot $run
@@ -122,7 +155,7 @@ $records=@();$touched=@()
 try {
     foreach($entry in $files){
         $target=SafePath $GamePath $entry.Path
-        # Identical existing loader/shared files are not owned by this mod.
+        # The existing loader and shared files are not owned by this mod.
         if($entry.Kind -eq 'Loader' -and (Test-Path -LiteralPath $target)){continue}
         if($entry.Kind -eq 'Settings' -and (Test-Path -LiteralPath $target)){continue}
         $backup=$null
