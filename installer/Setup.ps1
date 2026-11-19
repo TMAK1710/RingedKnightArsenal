@@ -23,8 +23,15 @@ function SafePath([string]$root,[string]$relative) {
 }
 function Put([string]$source,[string]$target){
     New-Item -ItemType Directory -Force -Path (Split-Path $target -Parent) | Out-Null
-    Copy-Item -LiteralPath $source -Destination $target -Force
-    if((Hash $source) -ne (Hash $target)){throw "Copy verification failed: $target"}
+    $temporary=$target+'.rka-'+[guid]::NewGuid().ToString('N')+'.tmp'
+    try{
+        [IO.File]::Copy($source,$temporary)
+        if((Hash $source) -ne (Hash $temporary)){throw "Copy verification failed: $target"}
+        if([IO.File]::Exists($target)){[IO.File]::Replace($temporary,$target,[NullString]::Value)}
+        else{[IO.File]::Move($temporary,$target)}
+    }finally{
+        if([IO.File]::Exists($temporary)){[IO.File]::Delete($temporary)}
+    }
 }
 function FindGame {
     $roots=@()
@@ -73,73 +80,87 @@ $receiptPath=SafePath $stateRoot 'installed.json'
 if($Action -eq 'Uninstall'){
     if(-not(Test-Path -LiteralPath $receiptPath)){throw 'No installation receipt found; nothing removed.'}
     $receipt=Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
-    $kept=0
-    foreach($entry in @($receipt.Files)){
+    $entries=@($receipt.Files)
+    [array]::Reverse($entries)
+    $restore=@(foreach($entry in $entries){
         if($entry.Kind -in @('Loader','Settings')){continue} # Shared loader stays available to other mods.
         $target=SafePath $GamePath $entry.Path
+        $backup=$null
+        if($entry.Backup){
+            $backup=SafePath $stateRoot $entry.Backup
+            $backupHash=Hash $backup
+            if($entry.PSObject.Properties['BackupHash'] -and $entry.BackupHash -ne $backupHash){throw "Damaged backup: $($entry.Path). Nothing removed."}
+        }
         if(Test-Path -LiteralPath $target){
-            if((Hash $target) -ne $entry.InstalledHash){Write-Warning "Kept changed file: $($entry.Path)";$kept++;continue}
-            if($entry.Backup){Put (SafePath $stateRoot $entry.Backup) $target}else{Remove-Item -LiteralPath $target}
-        }elseif($entry.Backup){Put (SafePath $stateRoot $entry.Backup) $target}
+            $currentHash=Hash $target
+            if($backup -and $currentHash -eq $backupHash){continue} # Can resume an interrupted uninstall.
+            if($currentHash -ne $entry.InstalledHash){throw "File changed after installation: $($entry.Path). Nothing removed. Back up the change before trying again."}
+        }elseif(-not $backup){continue}
+        [pscustomobject]@{Target=$target;Backup=$backup}
+    })
+    foreach($file in $restore){
+        if($file.Backup){Put $file.Backup $file.Target}
+        else{[IO.File]::Delete($file.Target)}
     }
-    if($kept){throw "Uninstall incomplete: $kept user-modified files preserved. Receipt retained for manual review."}
     Move-Item -LiteralPath $receiptPath -Destination (Join-Path $stateRoot ('uninstalled-'+[guid]::NewGuid().ToString('N')+'.json'))
     Write-Host 'Uninstalled. Previous files restored. Saves and backups retained.' -ForegroundColor Green
     return
 }
-$manifest=Get-Content -LiteralPath (Join-Path $PackageRoot 'manifest.json') -Raw | ConvertFrom-Json
+$manifestPath=Join-Path $PackageRoot 'manifest.json'
+if(-not [IO.File]::Exists($manifestPath)){throw 'manifest.json is missing. Extract the complete installation ZIP before running setup.'}
+$manifest=Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 if((Hash $exe) -ne $manifest.GameSHA256){throw 'Unsupported game executable. This package is pinned to Steam build 26367565; no files changed.'}
 $files=@($manifest.Files)
 if($files.Count -eq 0){throw 'Empty package'}
 $proxyPath='platform/steam/dwmapi.dll'
 $corePath='platform/steam/ue4ss/UE4SS.dll'
-$proxyDiffers=$false
+$ue4ssPrefix='platform/steam/ue4ss/'
+$overridePath='platform/steam/override.txt'
+$overrideFile=SafePath $GamePath $overridePath
+$loaderConflicts=@()
+$sources=@{}
 $seen=@{}
 foreach($entry in $files){
-    if($seen.ContainsKey($entry.Path)){throw 'Duplicate package destination'};$seen[$entry.Path]=$true
+    $key=$entry.Path.Replace('\','/')
+    if($seen.ContainsKey($key)){throw 'Duplicate package destination'};$seen[$key]=$true
     $source=SafePath (Join-Path $PackageRoot 'payload') $entry.Path
     $target=SafePath $GamePath $entry.Path
     if((Hash $source) -ne $entry.SHA256){throw "Damaged package: $($entry.Path)"}
-    if($entry.Kind -eq 'Loader' -and (Test-Path -LiteralPath $target) -and (Hash $target) -ne $entry.SHA256){
-        if($entry.Path -eq $proxyPath){$proxyDiffers=$true;continue}
-        if($entry.Path -eq $corePath){
-            throw 'UE4SS core differs: platform/steam/ue4ss/UE4SS.dll. This mod requires the exact bundled core. No files changed. Use a separate clean game installation or check with the maintainer of your existing mods.'
-        }
-        throw "Different shared UE4SS file: $($entry.Path). No files changed."
+    $sources[$entry.Path]=$source
+    if($key -eq ($ue4ssPrefix+'LICENSE')){continue}
+    if(($entry.Kind -eq 'Loader' -or $key -eq ($ue4ssPrefix+'MemberVariableLayout.ini')) -and
+            (Test-Path -LiteralPath $target) -and (Hash $target) -ne $entry.SHA256){
+        $loaderConflicts+=$entry.Path
     }
 }
-if($proxyDiffers){
-    $core=SafePath $GamePath $corePath
-    if(-not $seen.ContainsKey($corePath) -or -not [IO.File]::Exists($core)){
-        throw 'A different dwmapi.dll exists, but the required platform/steam/ue4ss/UE4SS.dll is missing. No files changed. Identify the existing loader before replacing it.'
+foreach($alternative in @($overridePath,'platform/steam/UE4SS.dll','platform/steam/Mods')){
+    if(Test-Path -LiteralPath (SafePath $GamePath $alternative)){$loaderConflicts+=$alternative}
+}
+$settings=SafePath $GamePath ($ue4ssPrefix+'UE4SS-settings.ini')
+if([IO.File]::Exists($settings) -and [IO.File]::ReadAllText($settings) -match '(?im)^[ \t]*(?:ModsFolderPath|[+-]ModsFolderPaths)[ \t]*=[ \t]*[^\s;#]'){
+    $loaderConflicts+='custom UE4SS mod folders'
+}
+$useSeparateLoader=$loaderConflicts.Count -gt 0
+if($useSeparateLoader){
+    if(-not $seen.ContainsKey($proxyPath) -or -not $seen.ContainsKey($corePath)){
+        throw 'Existing UE4SS differs and the package is missing the bundled loader. Extract the complete installation ZIP.'
     }
-    foreach($alternative in @('platform/steam/override.txt','platform/steam/UE4SS.dll')){
-        if(Test-Path -LiteralPath (SafePath $GamePath $alternative)){
-            throw "Existing loader may use a different UE4SS location ($alternative). No files changed. Check which UE4SS.dll the game loads."
-        }
-    }
-    Write-Warning 'Existing dwmapi.dll differs, but the UE4SS core matches. Setup can preserve the existing dwmapi.dll.'
+    Write-Host ('Existing UE4SS configuration detected: '+($loaderConflicts -join ', '))
+    Write-Host 'Setup will use a separate UE4SS folder. Other UE4SS mods in the original folder are paused until uninstall.'
 }
 if($Action -eq 'Verify'){Write-Host "Verified $($files.Count) payload files and game compatibility.";return}
 if(Test-Path -LiteralPath $receiptPath){
     $old=Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
-    if($old.PackageHash -eq (Hash (Join-Path $PackageRoot 'manifest.json'))){
+    if($old.PackageHash -eq (Hash $manifestPath)){
         $ok=$true
-        foreach($entry in $files){
-            if($entry.Kind -eq 'Settings' -or ($proxyDiffers -and $entry.Path -eq $proxyPath)){continue}
-            $t=SafePath $GamePath $entry.Path
-            if(-not(Test-Path -LiteralPath $t) -or (Hash $t) -ne $entry.SHA256){$ok=$false;break}
+        foreach($entry in @($old.Files)){
+            if($entry.Kind -eq 'Settings'){continue}
+            $target=SafePath $GamePath $entry.Path
+            if(-not [IO.File]::Exists($target) -or (Hash $target) -ne $entry.InstalledHash){$ok=$false;break}
         }
         if($ok){Write-Host 'This exact package is already installed.';return}
     }
     throw 'A managed installation already exists. Uninstall it first (backups are preserved), then install this package.'
-}
-if($proxyDiffers){
-    Write-Host 'Continue only if your existing loader already starts UE4SS from platform/steam/ue4ss.'
-    if((Read-Host 'Keep your current dwmapi.dll and install the mod? [y/N]') -ne 'y'){
-        Write-Host 'Canceled. No files changed.'
-        return
-    }
 }
 $run='install-'+(Get-Date -Format yyyyMMdd-HHmmss)+'-'+[guid]::NewGuid().ToString('N').Substring(0,8)
 $session=SafePath $stateRoot $run
@@ -151,25 +172,66 @@ if(Test-Path -LiteralPath $saveRoot){foreach($save in Get-ChildItem -LiteralPath
     $source=SafePath $saveRoot $relative
     Put $source (SafePath $session ('saves/'+$relative))
 }}
+$isolatedFolder=$null
+if($useSeparateLoader){
+    $isolatedFolder='ue4ss-rka-'+[guid]::NewGuid().ToString('N').Substring(0,12)
+    $separatePath=SafePath $GamePath ('platform/steam/'+$isolatedFolder)
+    if(Test-Path -LiteralPath $separatePath){throw 'Separate UE4SS folder already exists. Run again to choose a new folder.'}
+}
+$plan=@(foreach($entry in $files){
+    $relative=$entry.Path
+    $kind=$entry.Kind
+    if($useSeparateLoader){
+        if($relative -eq $proxyPath){continue} # Change the startup files after the payload is in place.
+        if($relative.StartsWith($ue4ssPrefix,[StringComparison]::OrdinalIgnoreCase)){
+            $relative='platform/steam/'+$isolatedFolder+'/'+$relative.Substring($ue4ssPrefix.Length)
+            $kind='Isolated'
+        }
+    }
+    [pscustomobject]@{Path=$relative;Kind=$kind;Source=$sources[$entry.Path];SHA256=$entry.SHA256}
+})
+if($useSeparateLoader){
+    $newOverride=SafePath $session 'override.txt'
+    [IO.File]::WriteAllText($newOverride,$isolatedFolder,[Text.Encoding]::ASCII)
+    $plan+=[pscustomobject]@{Path=$overridePath;Kind='Isolated';Source=$newOverride;SHA256=(Hash $newOverride)}
+    $proxySource=$sources[$proxyPath]
+    $plan+=[pscustomobject]@{Path=$proxyPath;Kind='Isolated';Source=$proxySource;SHA256=(Hash $proxySource)}
+}
 $records=@();$touched=@()
 try {
-    foreach($entry in $files){
+    foreach($entry in $plan){
         $target=SafePath $GamePath $entry.Path
         # The existing loader and shared files are not owned by this mod.
         if($entry.Kind -eq 'Loader' -and (Test-Path -LiteralPath $target)){continue}
         if($entry.Kind -eq 'Settings' -and (Test-Path -LiteralPath $target)){continue}
         $backup=$null
-        if(Test-Path -LiteralPath $target){$backup=$run+'/previous/'+$entry.Path;Put $target (SafePath $stateRoot $backup)}
-        $record=[pscustomobject]@{Path=$entry.Path;InstalledHash=$entry.SHA256;Backup=$backup;Kind=$entry.Kind}
+        $backupHash=$null
+        if(Test-Path -LiteralPath $target){
+            $backup=$run+'/previous/'+$entry.Path
+            $backupFile=SafePath $stateRoot $backup
+            Put $target $backupFile
+            $backupHash=Hash $backupFile
+        }
+        $record=[pscustomobject]@{Path=$entry.Path;InstalledHash=$entry.SHA256;Backup=$backup;BackupHash=$backupHash;Kind=$entry.Kind}
+        Put $entry.Source $target
         $touched+=$record
-        Put (SafePath (Join-Path $PackageRoot 'payload') $entry.Path) $target
         $records+=$record
     }
-    [pscustomobject]@{Version=$manifest.Version;PackageHash=(Hash (Join-Path $PackageRoot 'manifest.json'));Files=@($records);SaveBackup=$run+'/saves'} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $receiptPath -Encoding UTF8
+    $pendingReceipt=SafePath $session 'receipt.json'
+    [pscustomobject]@{Version=$manifest.Version;PackageHash=(Hash $manifestPath);Files=@($records);SaveBackup=$run+'/saves'} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $pendingReceipt -Encoding UTF8
+    [IO.File]::Move($pendingReceipt,$receiptPath)
 }catch{
     $failure=$_
     [array]::Reverse($touched)
-    foreach($entry in $touched){$target=SafePath $GamePath $entry.Path;if($entry.Backup){Put (SafePath $stateRoot $entry.Backup) $target}elseif(Test-Path -LiteralPath $target){Remove-Item -LiteralPath $target}}
+    $rollbackErrors=@()
+    foreach($entry in $touched){
+        try{
+            $target=SafePath $GamePath $entry.Path
+            if($entry.Backup){Put (SafePath $stateRoot $entry.Backup) $target}
+            else{[IO.File]::Delete($target)}
+        }catch{$rollbackErrors+="$($entry.Path): $($_.Exception.Message)"}
+    }
+    if($rollbackErrors.Count){Write-Warning ("Could not restore: "+($rollbackErrors -join '; ')+". Backups: $session")}
     throw $failure
 }
 Write-Host 'Installed. Load a save; Ringed Knight Sword is added to the weapon bag automatically. Equip it manually.' -ForegroundColor Green

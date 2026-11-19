@@ -11,13 +11,14 @@ write(GAME/'platform/steam/PBZ.exe','fake executable; never started')
 SAVE=GAME/'ProjectPBZ/Saved/SaveGames/test.sav';write(SAVE,'original-save')
 OTHER=GAME/'platform/steam/ue4ss/Mods/OtherMod/Scripts/main.lua';write(OTHER,'unrelated-mod')
 MOD='platform/steam/ue4ss/Mods/RingedKnightArsenal/Scripts/main.lua'
+MOD_MARKER='platform/steam/ue4ss/Mods/RingedKnightArsenal/enabled.txt'
 LOADER='platform/steam/ue4ss/UE4SS.dll'
 PROXY='platform/steam/dwmapi.dll'
 SETTINGS='platform/steam/ue4ss/UE4SS-settings.ini'
 write(GAME/MOD,'previous-mod')
 write(GAME/SETTINGS,'existing-settings')
 entries=[]
-for rel,kind,value in [(MOD,'Mod','release-mod'),(PROXY,'Loader','fake-proxy'),(LOADER,'Loader','fake-loader'),(SETTINGS,'Settings','default-settings')]:
+for rel,kind,value in [(MOD,'Mod','release-mod'),(MOD_MARKER,'Mod',''),(PROXY,'Loader','fake-proxy'),(LOADER,'Loader','fake-loader'),(SETTINGS,'Settings','default-settings')]:
     p=PACKAGE/'payload'/rel;write(p,value);entries.append(dict(Path=rel,Kind=kind,SHA256=sha(p)))
 manifest=dict(Version='fixture',GameSHA256=sha(GAME/'platform/steam/PBZ.exe'),Files=entries)
 def save_manifest():write(PACKAGE/'manifest.json',json.dumps(manifest))
@@ -63,7 +64,7 @@ function New-Object {
     result=subprocess.run(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass','-File',str(wrapper),
         str(ROOT/'installer/Setup.ps1'),str(steam),str(PACKAGE),str(GAME),str(int(library_has_game))],
         capture_output=True,text=True)
-    assert result.returncode==0 and 'Verified 4 payload files' in result.stdout,(result.stdout,result.stderr)
+    assert result.returncode==0 and 'Verified 5 payload files' in result.stdout,(result.stdout,result.stderr)
     assert ('Folder picker reached' in result.stdout) != library_has_game,result.stdout
 
 verify_discovery(library_has_game=True)
@@ -84,22 +85,66 @@ assert (GAME/LOADER).read_text()=='fake-loader'
 assert OTHER.read_text()=='unrelated-mod' and SAVE.read_text()=='original-save'
 run('Install');write(GAME/MOD,'user-edit');run('Uninstall',False)
 assert (GAME/MOD).read_text()=='user-edit'
+assert (GAME/MOD_MARKER).is_file()
 write(GAME/MOD,'release-mod');run('Uninstall')
-write(GAME/LOADER,'incompatible-loader');assert 'UE4SS core differs' in run('Install',False)
-assert (GAME/MOD).read_text()=='previous-mod';write(GAME/LOADER,'fake-loader')
-write(GAME/PROXY,'existing-proxy')
-assert 'core matches' in run('Verify')
-assert 'Canceled' in run('Install',response='n\n')
-assert (GAME/MOD).read_text()=='previous-mod'
-run('Install',response='y\n')
-assert (GAME/PROXY).read_text()=='existing-proxy' and (GAME/MOD).read_text()=='release-mod'
-assert 'already installed' in run('Install')
-run('Uninstall')
-assert (GAME/PROXY).read_text()=='existing-proxy' and (GAME/MOD).read_text()=='previous-mod'
 override=GAME/'platform/steam/override.txt'
-write(override,'somewhere else');assert 'different UE4SS location' in run('Install',False);override.unlink()
-(GAME/LOADER).unlink();assert 'UE4SS.dll is missing' in run('Install',False);write(GAME/LOADER,'fake-loader')
-assert (GAME/PROXY).read_text()=='existing-proxy' and (GAME/MOD).read_text()=='previous-mod'
+for original_core,original_override in [('fake-loader',None),(None,None),('old-core','old-loader-directory')]:
+    write(GAME/PROXY,'existing-proxy')
+    if original_core is None:
+        (GAME/LOADER).unlink()
+    else:
+        write(GAME/LOADER,original_core)
+    if original_override is not None:
+        write(override,original_override)
+    assert 'separate UE4SS folder' in run('Verify')
+    assert 'separate UE4SS folder' in run('Install')
+    separate=override.parent/override.read_text()
+    assert separate.name.startswith('ue4ss-rka-')
+    assert (separate/'UE4SS.dll').read_text()=='fake-loader'
+    assert (separate/Path(MOD).relative_to('platform/steam/ue4ss')).read_text()=='release-mod'
+    assert (GAME/PROXY).read_text()=='fake-proxy'
+    assert (GAME/MOD).read_text()=='previous-mod' and OTHER.read_text()=='unrelated-mod'
+    assert 'already installed' in run('Install')
+    run('Uninstall')
+    assert not (separate/'UE4SS.dll').exists()
+    assert (GAME/PROXY).read_text()=='existing-proxy'
+    if original_core is None:
+        assert not (GAME/LOADER).exists()
+    else:
+        assert (GAME/LOADER).read_text()==original_core
+    if original_override is None:
+        assert not override.exists()
+    else:
+        assert override.read_text()==original_override
+        override.unlink()
+    write(GAME/LOADER,'fake-loader')
+write(GAME/PROXY,'fake-proxy')
+write(GAME/SETTINGS,'[Overrides]\nModsFolderPath = E:/CustomMods')
+assert 'custom UE4SS mod folders' in run('Install')
+run('Uninstall')
+assert (GAME/SETTINGS).read_text()=='[Overrides]\nModsFolderPath = E:/CustomMods'
+write(GAME/SETTINGS,'existing-settings')
+run('Install')
+write(GAME/MOD,'previous-mod') # Simulate an interrupted uninstall after backup restore.
+run('Uninstall')
+assert not (GAME/MOD_MARKER).exists()
+write(GAME/PROXY,'locked-existing-proxy')
+write(override,'old-loader-directory')
+lock_test=CASE/'setup-with-locked-proxy.ps1'
+write(lock_test,r"""
+param($Setup,$Game,$Package)
+$ErrorActionPreference='Stop'
+$proxy=[IO.Path]::Combine($Game,'platform/steam/dwmapi.dll')
+$lock=[IO.File]::Open($proxy,'Open','Read','Read')
+try{& $Setup -Action Install -GamePath $Game -PackageRoot $Package}finally{$lock.Dispose()}
+""")
+failed=subprocess.run(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass','-File',str(lock_test),
+    str(ROOT/'installer/Setup.ps1'),str(GAME),str(PACKAGE)],capture_output=True,text=True)
+assert failed.returncode!=0 and 'Replace' in failed.stderr and 'Could not restore' not in failed.stdout,(failed.stdout,failed.stderr)
+assert (GAME/PROXY).read_text()=='locked-existing-proxy' and override.read_text()=='old-loader-directory'
+assert not list(override.parent.glob('ue4ss-rka-*/UE4SS.dll'))
+assert not (GAME/'RingedKnightArsenal-Backup/installed.json').exists()
+override.unlink()
 write(GAME/PROXY,'fake-proxy')
 write(PACKAGE/'payload'/MOD,'corrupt');run('Install',False);write(PACKAGE/'payload'/MOD,'release-mod')
 manifest['GameSHA256']='0'*64;save_manifest();run('Install',False)
@@ -111,4 +156,4 @@ rel='blocked/file.txt';write(PACKAGE/'payload'/rel,'new-file');write(GAME/'block
 manifest['Files'].append(dict(Path=rel,Kind='Mod',SHA256=sha(PACKAGE/'payload'/rel)));save_manifest()
 run('Install',False);assert (GAME/MOD).read_text()=='previous-mod'
 assert SAVE.read_text()=='original-save' and OTHER.read_text()=='unrelated-mod'
-print(json.dumps({'result':'PASS','checks':['steam-discovery-missing-drive','folder-picker-fallback','install','backup','uninstall-restore','shared-loader-retained','other-mod-preserved','settings-preserved','user-edit-preserved','loader-core-conflict','existing-proxy-opt-in','missing-core','custom-loader-path','corruption','game-version','path-escape','late-failure-rollback'],'fixture':str(CASE)}))
+print(json.dumps({'result':'PASS','checks':['steam-discovery-missing-drive','folder-picker-fallback','install','backup','uninstall-restore','uninstall-retry','uninstall-preflight','shared-loader-retained','other-mod-preserved','settings-preserved','isolated-loader-conflicts','original-proxy-and-override-restored','locked-proxy-rollback','custom-mods-folder','corruption','game-version','path-escape','late-failure-rollback'],'fixture':str(CASE)}))
